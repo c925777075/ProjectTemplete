@@ -31,7 +31,7 @@ class MyTrainingArguments(TrainingArguments):
 
 def prepare_args(args=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default="config/vqvae/vqvae.py", help='train config file path')
+    parser.add_argument('--config', default="config/videolm/videolm.py", help='train config file path')
     parser.add_argument(
         '--cfg-options',
         nargs='+',

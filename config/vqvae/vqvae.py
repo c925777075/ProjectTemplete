@@ -7,8 +7,8 @@ now = datetime.now()
 formatted_now = now.strftime("%Y_%m_%d")
 
 training_args = dict(
-    num_train_epochs=5,
-    max_steps=10000,
+    num_train_epochs=10,
+    max_steps=20000,
     do_train=True,
     do_eval=True,
     do_predict=False,

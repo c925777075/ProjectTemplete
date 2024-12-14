@@ -83,8 +83,8 @@ def main():
     patch_transformer_logging()
     cfg, training_args = prepare_args()
     patch_cosine_with_warmup_schedule(getattr(training_args, 'minimal_learning_rate', 0.0))
-    if os.environ.get("WANDB_DISABLED").lower() == "false":
-        wandb.login(key=training_args.wandb_key)
+    # if os.environ.get("WANDB_DISABLED").lower() == "false":
+    #     wandb.login(key=training_args.wandb_key)
     os.makedirs(training_args.output_dir, exist_ok=True)
 
     if training_args.process_index == 0 and os.getenv('USE_SACRED', 'false').lower() == 'true':
