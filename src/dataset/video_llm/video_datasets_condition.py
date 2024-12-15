@@ -43,7 +43,7 @@ def temporal_random_crop(vframes, num_frames, frame_interval):
 
 
 @DATASETS.register_module()
-class VideoDatasets(Dataset):
+class VideoDatasetsCondition(Dataset):
     def __init__(self, cfg, mode):
         self.cfg = cfg
         self.datasets = self.cfg.dataset

@@ -47,6 +47,10 @@ model_args = dict(
         VISION_DECODER=dict(
             checkpoint_dec=f'/mnt/i/myai/MyLab/Cosmos-Tokenizer/ckpts/Cosmos-Tokenizer-DV4x8x8/decoder.jit'
         ),
+        LLM=dict(
+            enable=True,
+            model_path="/mnt/i/myai/MyLab/pretrained_models/Qwen2.5-0.5B-Instruct",
+        ),
         MLLM=dict(
             vocab_size=64008,
             hidden_size=512,

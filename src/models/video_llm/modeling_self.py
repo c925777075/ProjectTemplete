@@ -29,6 +29,8 @@ from src.models.video_llm.mllm.modeling_emu3 import (
 )
 from transformers.modeling_utils import PreTrainedModel
 from src.models.root import MODELS
+from src.models.video_llm.llm.textllm import LLMModel
+from transformers import AutoConfig
 
 
 class FlashAttention2(Emu3FlashAttention2):
@@ -290,6 +292,7 @@ class VideoDecoderLayer(Emu3DecoderLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        text_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         spatial_position_ids: Optional[torch.LongTensor] = None,
@@ -325,6 +328,10 @@ class VideoDecoderLayer(Emu3DecoderLayer):
         b, t, h, w, c = hidden_states.shape
 
         hidden_states = hidden_states.flatten(2, 3).view(-1, h*w, c)
+        if text_embeds is not None:
+            text_embeds = text_embeds.unsqueeze(1)
+            hidden_states = torch.cat([text_embeds, hidden_states], dim=1)
+
         hidden_states, self_attn_weights, present_key_value = self.self_attn_spat(
             hidden_states=hidden_states,
             attention_mask=None,
@@ -335,6 +342,8 @@ class VideoDecoderLayer(Emu3DecoderLayer):
             use_cache=False,
             **kwargs,
         )
+        if text_embeds is not None:
+            hidden_states = hidden_states[:, 1:, :]
 
         hidden_states = hidden_states.view(b, t, h*w, c).view(b, t, h, w, c)
         hidden_states = residual + self.dropout(hidden_states)
@@ -343,6 +352,9 @@ class VideoDecoderLayer(Emu3DecoderLayer):
         hidden_states = hidden_states.permute(0, 2, 3, 1, 4).contiguous().flatten(1, 2).view(-1, t, c)
         # hidden_states = hidden_states.mean(dim=(2, 3))
 
+        if text_embeds is not None:
+            text_embeds = text_embeds.unsqueeze(1)
+            hidden_states = torch.cat([text_embeds, hidden_states], dim=1)
         # Self Attention for time
         hidden_states, self_attn_weights, present_key_value = self.self_attn_time(
             hidden_states=hidden_states,
@@ -354,6 +366,8 @@ class VideoDecoderLayer(Emu3DecoderLayer):
             use_cache=use_cache,
             **kwargs,
         )
+        if text_embeds is not None:
+            hidden_states = hidden_states[:, 1:, :]
         hidden_states = hidden_states.view(b, h*w, t, c).permute(0, 2, 1, 3).contiguous().view(b, t, h, w, c)
         hidden_states = residual + self.dropout(hidden_states)
 
@@ -383,6 +397,7 @@ class VideoModel(Emu3Model):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
+        text_embeds: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -473,6 +488,7 @@ class VideoModel(Emu3Model):
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
+                    text_embeds,
                     attention_mask,
                     position_ids,
                     spatial_position_ids,
@@ -483,6 +499,7 @@ class VideoModel(Emu3Model):
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
+                    text_embeds=text_embeds,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     spatial_position_ids=spatial_position_ids,
@@ -531,6 +548,7 @@ class VideoForCausalLM(Emu3ForCausalLM):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
+        text_embeds: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -550,6 +568,7 @@ class VideoForCausalLM(Emu3ForCausalLM):
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
+            text_embeds=text_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -605,64 +624,47 @@ class VideoLLM(PreTrainedModel):
         config = VideoLLMConfig(**cfg.MLLM)
         super(VideoLLM, self).__init__(config)
         self.cfg = cfg
+        self.text_condition = False
+        if 'LLM' in cfg and cfg.LLM.enable:
+            text_config = AutoConfig.from_pretrained(cfg.LLM.model_path)
+            self.text_condition = True
+            self.text_llm = LLMModel(text_config)
+            self.text_llm.eval()
+            self._freeze_models(self.text_llm)
+
         self.encoder = CausalVideoTokenizer(checkpoint_enc=checkpoint_enc)
         self.encoder.eval()
-        for n, p in self.encoder.named_parameters():
-            p.requires_grad = False
+        self._freeze_models(self.encoder)
         self.mllm = VideoForCausalLM(config)
+        # self.mllm = Emu3ForCausalLM(config)
 
+    def _freeze_models(self, module):
+        for n, p in module.named_parameters():
+            p.requires_grad = False
 
-    def forward(self, video):
+    def forward(self, video, text_inputs=None):
         first_frame = video[:, :, :1, :, :]
         first_frames = first_frame.repeat(1, 1, self.cfg.TIME_RATIO-1, 1, 1)
         video = torch.cat([first_frames, video], dim=2)
         with torch.no_grad():
             (indices, codes) = self.encoder.encode(video)
         indices = indices.type(torch.int64)
-        output = self.mllm(input_ids=indices, labels=indices)
+        text_embedings = None
+        if self.text_condition:
+            with torch.no_grad():
+                text_embeds = self.text_llm(**text_inputs)
+                text_embeds = text_embeds.detach()
+                padding_mask = text_inputs['attention_mask']
+                bs = text_embeds.shape[0]
+                text_embedings = []
+                for b in range(bs):
+                    text_hidden_state_unpad = text_embeds[b][padding_mask[b].type(torch.bool)]
+                    text_embedings.append(text_hidden_state_unpad.mean(dim=0))
+                text_embedings = torch.stack(text_embedings)
+
+        output = self.mllm(input_ids=indices,
+                           labels=indices,
+                           text_embeds=text_embedings,
+                           text_attention_mask=text_inputs["attention_mask"])
         loss = output.loss
         return {"loss": loss}
-
-if __name__ == "__main__":
-    import time
-    config = Emu3Config(
-        vocab_size=64008,
-        hidden_size=256,
-        intermediate_size=512,
-        num_hidden_layers=3,
-        num_attention_heads=8,
-        num_key_value_heads=8,
-        hidden_act="silu",
-        max_position_embeddings=1024,
-        initializer_range=0.02,
-        rms_norm_eps=1e-5,
-        attn_implementation="eager",
-    )
-    model_self = VideoForCausalLM(config).bfloat16().cuda()
-    n = 32
-    x = torch.randint(0, 101, (1, 16, n, n), dtype=torch.int64).cuda()
-    with torch.no_grad():
-        y = model_self(input_ids=x, labels=x)
-        t1 = time.time()
-        for _ in range(5):
-            y = model_self(input_ids=x, labels=x)
-        t2 = time.time()
-        print(f"model parameters size: {sum(p.numel() for p in model_self.parameters())}")
-        print("model_self time cost: ", t2 - t1)
-
-    # with torch.no_grad():
-    #     model_emu3 = Emu3Model(config).bfloat16().cuda()
-    #     x = x.view(2, -1)
-    #     print(x.shape)
-    #     y = model_emu3(input_ids=x)
-    #     t3 = time.time()
-    #     for _ in range(5):
-    #         y = model_emu3(input_ids=x)
-    #     t4 = time.time()
-    #     print(f"model parameters size: {sum(p.numel() for p in model_emu3.parameters())}")
-    #     print("model_emu3 time cost: ", t4 - t3)
-
-    
-    
-
-    

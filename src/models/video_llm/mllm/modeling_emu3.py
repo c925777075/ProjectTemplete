@@ -767,6 +767,7 @@ class Emu3DecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        text_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
