@@ -29,9 +29,8 @@ from src.models.video_llm.mllm.modeling_emu3 import (
 )
 from transformers.modeling_utils import PreTrainedModel
 from src.models.root import MODELS
-from src.models.video_llm.llm.textllm import LLMModel
-from transformers import AutoConfig
-
+from transformers import AutoConfig, AutoModelForCausalLM
+from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa
 
 class FlashAttention2(Emu3FlashAttention2):
     def forward(
@@ -182,6 +181,66 @@ class FlashAttention2(Emu3FlashAttention2):
 
         return attn_output
 
+class CrossAttention(Emu3Attention):
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        is_causal: bool = False,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = q.size()
+        k_len, v_len = k.shape[1], v.shape[1]
+        query_states = self.q_proj(q)
+        key_states = self.k_proj(k)
+        value_states = self.v_proj(v)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, k_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, v_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                )
+
+        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+        # Reference: https://github.com/pytorch/pytorch/issues/112577.
+        if query_states.device.type == "cuda" and attention_mask is not None:
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=encoder_attention_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
+            is_causal=False,
+        )
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, past_key_value
+
+
 class SdpaAttention(Emu3Attention):
     """
     Emu3 attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
@@ -283,7 +342,14 @@ class VideoDecoderLayer(Emu3DecoderLayer):
         self.dropout = nn.Dropout(config.attention_dropout)
         config._attn_implementation = "eager"
         self.self_attn_spat = EMU3_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
-        self.self_attn_time = EMU3_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
+        self.self_attn_temp = EMU3_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
+        if 'llm_hidden_size' in config:
+            self.text_project_mlp = nn.Sequential(
+                nn.Linear(config.llm_hidden_size, config.hidden_size * 2),
+                nn.GELU(),
+                nn.Linear(config.hidden_size * 2, config.hidden_size),
+            )
+        self.cross_attn = CrossAttention(config)
 
         self.mlp = Emu3MLP(config)
         self.input_layernorm = Emu3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -294,6 +360,8 @@ class VideoDecoderLayer(Emu3DecoderLayer):
         hidden_states: torch.Tensor,
         text_embeds: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        text_attention_mask: Optional[torch.Tensor] = None,
+        text_padding_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         spatial_position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
@@ -326,11 +394,7 @@ class VideoDecoderLayer(Emu3DecoderLayer):
 
         # Self Attention for spatial
         b, t, h, w, c = hidden_states.shape
-
         hidden_states = hidden_states.flatten(2, 3).view(-1, h*w, c)
-        if text_embeds is not None:
-            text_embeds = text_embeds.unsqueeze(1)
-            hidden_states = torch.cat([text_embeds, hidden_states], dim=1)
 
         hidden_states, self_attn_weights, present_key_value = self.self_attn_spat(
             hidden_states=hidden_states,
@@ -342,21 +406,44 @@ class VideoDecoderLayer(Emu3DecoderLayer):
             use_cache=False,
             **kwargs,
         )
-        if text_embeds is not None:
-            hidden_states = hidden_states[:, 1:, :]
-
         hidden_states = hidden_states.view(b, t, h*w, c).view(b, t, h, w, c)
         hidden_states = residual + self.dropout(hidden_states)
+
+        # Cross Attention
+        if text_embeds is not None:
+            residual = hidden_states
+            hidden_states = hidden_states.flatten(2, 3).view(-1, h*w, c)
+
+            text_embeds = self.text_project_mlp(text_embeds)
+            # text_embeds = text_embeds.repeat(t, 1, 1)
+            seq_len, seq_dim = text_embeds.shape[1:]
+            text_embeds_repeat_t = text_embeds.unsqueeze(1).repeat(1, t, 1, 1).view(-1, seq_len, seq_dim)
+            bs, _, row, col = text_attention_mask.shape
+            text_attention_mask = text_attention_mask.unsqueeze(1).repeat(1, t, 1, 1, 1).view(-1, 1, row, col)
+            hidden_states = self.cross_attn(q=hidden_states, 
+                                            k=text_embeds_repeat_t, 
+                                            v=text_embeds_repeat_t, 
+                                            encoder_attention_mask=text_attention_mask)[0]
+            hidden_states = hidden_states.view(b, t, h*w, c).view(b, t, h, w, c)
+            hidden_states = residual + self.dropout(hidden_states)
+
         residual = hidden_states
 
         hidden_states = hidden_states.permute(0, 2, 3, 1, 4).contiguous().flatten(1, 2).view(-1, t, c)
         # hidden_states = hidden_states.mean(dim=(2, 3))
 
-        if text_embeds is not None:
-            text_embeds = text_embeds.unsqueeze(1)
-            hidden_states = torch.cat([text_embeds, hidden_states], dim=1)
         # Self Attention for time
-        hidden_states, self_attn_weights, present_key_value = self.self_attn_time(
+        if text_embeds is not None:
+            bs = text_embeds.shape[0]
+            text_embedings = []
+            for ii in range(bs):
+                text_hidden_state_unpad = text_embeds[ii][text_padding_mask[ii].type(torch.bool)]
+                text_embedings.append(text_hidden_state_unpad.mean(dim=0))
+            text_embedings = torch.stack(text_embedings)
+            text_embedings = text_embedings.unsqueeze(1).repeat(1, h*w, 1).view(-1, text_embedings.shape[-1])
+            hidden_states[:, 0, :] = hidden_states[:, 0, :] + text_embedings
+
+        hidden_states, self_attn_weights, present_key_value = self.self_attn_temp(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -366,8 +453,6 @@ class VideoDecoderLayer(Emu3DecoderLayer):
             use_cache=use_cache,
             **kwargs,
         )
-        if text_embeds is not None:
-            hidden_states = hidden_states[:, 1:, :]
         hidden_states = hidden_states.view(b, h*w, t, c).permute(0, 2, 1, 3).contiguous().view(b, t, h, w, c)
         hidden_states = residual + self.dropout(hidden_states)
 
@@ -399,6 +484,7 @@ class VideoModel(Emu3Model):
         input_ids: torch.LongTensor = None,
         text_embeds: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        text_attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -472,6 +558,14 @@ class VideoModel(Emu3Model):
                 attention_mask, (batch_size*h*w, seq_length), inputs_embeds, past_key_values_length
             )
 
+        text_padding_mask = None
+        if text_attention_mask is not None and text_embeds is not None:
+            text_padding_mask = text_attention_mask
+            text_attention_mask = _prepare_4d_attention_mask_for_sdpa(mask=text_attention_mask, dtype=inputs_embeds.dtype, tgt_len=input_ids.shape[2]*input_ids.shape[3])
+
+        if text_attention_mask is None and text_embeds is not None:
+            text_attention_mask = torch.zeros((inputs_embeds.shape[0], 1, input_ids.shape[2]*input_ids.shape[3], text_padding_mask.shape[1]), device=text_padding_mask.device).type(inputs_embeds.dtype)
+
         # embed positions
         hidden_states = self.dropout(inputs_embeds)
 
@@ -490,6 +584,8 @@ class VideoModel(Emu3Model):
                     hidden_states,
                     text_embeds,
                     attention_mask,
+                    text_attention_mask,
+                    text_padding_mask,
                     position_ids,
                     spatial_position_ids,
                     past_key_values,
@@ -501,6 +597,8 @@ class VideoModel(Emu3Model):
                     hidden_states,
                     text_embeds=text_embeds,
                     attention_mask=attention_mask,
+                    text_attention_mask=text_attention_mask,
+                    text_padding_mask=text_padding_mask,
                     position_ids=position_ids,
                     spatial_position_ids=spatial_position_ids,
                     past_key_value=past_key_values,
@@ -550,6 +648,7 @@ class VideoForCausalLM(Emu3ForCausalLM):
         input_ids: torch.LongTensor = None,
         text_embeds: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        text_attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -570,6 +669,7 @@ class VideoForCausalLM(Emu3ForCausalLM):
             input_ids=input_ids,
             text_embeds=text_embeds,
             attention_mask=attention_mask,
+            text_attention_mask=text_attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
@@ -626,11 +726,12 @@ class VideoLLM(PreTrainedModel):
         self.cfg = cfg
         self.text_condition = False
         if 'LLM' in cfg and cfg.LLM.enable:
-            text_config = AutoConfig.from_pretrained(cfg.LLM.model_path)
             self.text_condition = True
-            self.text_llm = LLMModel(text_config)
+            llm_config = AutoConfig.from_pretrained(cfg.LLM.model_path)
+            self.text_llm = AutoModelForCausalLM.from_pretrained(cfg.LLM.model_path)
             self.text_llm.eval()
             self._freeze_models(self.text_llm)
+            config.llm_hidden_size = llm_config.hidden_size
 
         self.encoder = CausalVideoTokenizer(checkpoint_enc=checkpoint_enc)
         self.encoder.eval()
@@ -649,22 +750,17 @@ class VideoLLM(PreTrainedModel):
         with torch.no_grad():
             (indices, codes) = self.encoder.encode(video)
         indices = indices.type(torch.int64)
-        text_embedings = None
+        text_embeds = None
+        text_padding_mask = None
         if self.text_condition:
             with torch.no_grad():
-                text_embeds = self.text_llm(**text_inputs)
+                text_embeds = self.text_llm(**text_inputs, output_hidden_states=True).hidden_states[-1]
                 text_embeds = text_embeds.detach()
-                padding_mask = text_inputs['attention_mask']
-                bs = text_embeds.shape[0]
-                text_embedings = []
-                for b in range(bs):
-                    text_hidden_state_unpad = text_embeds[b][padding_mask[b].type(torch.bool)]
-                    text_embedings.append(text_hidden_state_unpad.mean(dim=0))
-                text_embedings = torch.stack(text_embedings)
+                text_padding_mask = text_inputs['attention_mask']
 
         output = self.mllm(input_ids=indices,
                            labels=indices,
-                           text_embeds=text_embedings,
-                           text_attention_mask=text_inputs["attention_mask"])
+                           text_embeds=text_embeds,
+                           text_attention_mask=text_padding_mask)
         loss = output.loss
         return {"loss": loss}
